@@ -3,7 +3,6 @@ import numpy as np
 import streamlit as st
 from skimage import color
 from io import BytesIO
-from PIL import Image
 
 # ==========================================
 # 页面基础设置
@@ -13,24 +12,54 @@ st.title("🎨 智能图像换色工具")
 st.markdown("上传模特图、蒙版和参考颜色图，自动计算色差并生成替换后的效果。")
 
 # ==========================================
-# 算法核心函数 
+# 算法核心函数 (已升级：K-Means 智能主色提取)
 # ==========================================
+def extract_dominant_lab(img_bgr):
+    """提取图像中心区域的聚类主色，抗高光/阴影干扰"""
+    h, w = img_bgr.shape[:2]
+    
+    # 1. 扩大取样范围：取画面中心 60% 的区域 (跳过了边缘的纯背景)
+    crop = img_bgr[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]
+    
+    # 2. 缩小图像加快计算速度 (100x100足够提取颜色分布了)
+    crop_small = cv2.resize(crop, (100, 100))
+    img_lab = cv2.cvtColor(crop_small, cv2.COLOR_BGR2LAB)
+    
+    # 3. 使用 K-Means 聚类提取主色调
+    pixels = np.float32(img_lab.reshape(-1, 3))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    
+    # 假设区域内主要有3种颜色：纯净固有色、高光/皮肤、阴影褶皱
+    K = 3 
+    _, labels, centers = cv2.kmeans(pixels, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    
+    # 4. 找到占比最大的那个颜色聚类（大概率就是纯净的固有色）
+    counts = np.bincount(labels.flatten())
+    dominant_cluster_idx = np.argmax(counts)
+    
+    return centers[dominant_cluster_idx]
+
 def get_standard_lab(img_bgr, mask_3d=None):
     img_f = img_bgr.astype(np.float32) / 255.0
     lab_f = cv2.cvtColor(img_f, cv2.COLOR_BGR2Lab)
+    
     if mask_3d is not None:
         mask_bool = mask_3d[:, :, 0] > 0.5
         if np.any(mask_bool): return np.mean(lab_f[mask_bool], axis=0)
-    h, w = img_bgr.shape[:2]
-    return np.mean(lab_f[int(h * 0.4):int(h * 0.6), int(w * 0.4):int(w * 0.6)], axis=(0, 1))
+        
+    # 当没有蒙版时（处理参考图），使用主色提取算法
+    dominant_lab_8bit = extract_dominant_lab(img_bgr)
+    return dominant_lab_8bit * [100.0/255.0, 1.0, 1.0] - [0, 128.0, 128.0]
 
 def get_lab_metrics(img_bgr, mask_3d=None):
     img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    
     if mask_3d is not None:
         mask_bool = mask_3d[:, :, 0] > 0.5
         if np.any(mask_bool): return np.mean(img_lab[mask_bool], axis=0)
-    h, w = img_bgr.shape[:2]
-    return np.mean(img_lab[int(h * 0.4):int(h * 0.6), int(w * 0.4):int(w * 0.6)], axis=(0, 1))
+        
+    # 当没有蒙版时，使用 K-Means 主色提取
+    return extract_dominant_lab(img_bgr)
 
 def preprocess_mask(m, shape):
     if m is None: return np.zeros((*shape, 3), dtype=np.float32)
@@ -99,7 +128,8 @@ with col1:
 with col2:
     mask_file = st.file_uploader("2. 上传蒙版图 (PNG/JPG)", type=['jpg', 'jpeg', 'png'])
 with col3:
-    ref_file = st.file_uploader("3. 上传参考图 (目标颜色)", type=['jpg', 'jpeg', 'png'])
+    # 提示语已优化，指导用户操作
+    ref_file = st.file_uploader("3. 上传参考图 (自动提取主色，建议尽量规避背景)", type=['jpg', 'jpeg', 'png'])
 
 if orig_file and mask_file and ref_file:
     if st.button("🚀 开始计算并渲染", use_container_width=True):
@@ -118,7 +148,7 @@ if orig_file and mask_file and ref_file:
             is_neon = (a > 160 or a < 100) or (b > 160)
             
             mode_text = '【荧光色】' if is_neon else '【常规色】'
-            st.info(f"🎨 分析完毕 | 模式: {mode_text} | 目标LAB: {target_lab_8bit}")
+            st.info(f"🎨 分析完毕 | 模式: {mode_text} | 目标LAB(K-Means主色提取): {target_lab_8bit}")
 
             candidates = []
             l_off, a_off, b_off = 0.0, 0.0, 0.0
@@ -147,7 +177,7 @@ if orig_file and mask_file and ref_file:
             candidates.sort(key=lambda x: x['de'])
 
             # ==========================
-            # 3. 筛选并展示结果 (已更新)
+            # 3. 筛选并展示结果 (含去重与右侧对比参考图)
             # ==========================
             
             # 先过滤出真正有差异的候选图
@@ -175,7 +205,7 @@ if orig_file and mask_file and ref_file:
             with cols[-1]: 
                 ref_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
                 st.image(ref_rgb, caption="📍 颜色参考图", use_column_width=True)
-                st.markdown("<div style='text-align: center; color: gray; font-size: 14px;'>（目标颜色）</div>", unsafe_allow_html=True)
+                st.markdown("<div style='text-align: center; color: gray; font-size: 14px;'>（提取主色对比）</div>", unsafe_allow_html=True)
 
             # 依次展示生成的候选图和下载按钮
             for idx, c in enumerate(valid_candidates):
