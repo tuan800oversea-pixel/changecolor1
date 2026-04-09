@@ -6,15 +6,17 @@ from skimage import color
 # ==========================================
 # 页面基础设置
 # ==========================================
-st.set_page_config(page_title="智能图像换色工具", layout="wide")
-st.title("🎨 智能图像换色工具")
-st.markdown("上传模特图、蒙版和参考颜色图，自动计算色差并生成替换后的效果。")
+st.set_page_config(page_title="智能图像换色工具-超清无损版", layout="wide")
+st.title("🎨 智能图像换色工具 (超清无损版)")
+st.markdown("上传模特图、蒙版和参考色，系统将自动推演光影参数并输出原画质结果。")
 
 # ==========================================
-# 算法核心函数 (保留K-Means智能主色提取)
+# 算法核心函数
 # ==========================================
 def extract_dominant_lab(img_bgr):
+    """使用 K-Means 聚类提取图像中心区域的固有色，避开高光和阴影"""
     h, w = img_bgr.shape[:2]
+    # 取中心 60% 区域
     crop = img_bgr[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]
     crop_small = cv2.resize(crop, (100, 100))
     img_lab = cv2.cvtColor(crop_small, cv2.COLOR_BGR2LAB)
@@ -95,10 +97,9 @@ def render_neon(orig_img, mask_3d, target_lab, params):
     return np.clip(final_out, 0, 255).astype(np.uint8)
 
 # ==========================================
-# 图像工具函数
+# 工具函数
 # ==========================================
 def load_uploaded_image(uploaded_file, is_mask=False):
-    """只负责读取为原始尺寸数组"""
     if uploaded_file is not None:
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         flags = cv2.IMREAD_UNCHANGED if is_mask else cv2.IMREAD_COLOR
@@ -106,7 +107,7 @@ def load_uploaded_image(uploaded_file, is_mask=False):
     return None
 
 def create_low_res_proxy(img, max_width=800):
-    """为草图计算专用：将图片缩小，极大降低内存占用和提升速度"""
+    """草图计算专用：将图片缩小以保护内存"""
     if img is None: return None
     h, w = img.shape[:2]
     if w > max_width:
@@ -115,7 +116,7 @@ def create_low_res_proxy(img, max_width=800):
     return img
 
 # ==========================================
-# Streamlit 前端交互与工作流
+# 主流程
 # ==========================================
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -123,22 +124,21 @@ with col1:
 with col2:
     mask_file = st.file_uploader("2. 上传蒙版图 (PNG/JPG)", type=['jpg', 'jpeg', 'png'])
 with col3:
-    ref_file = st.file_uploader("3. 上传参考图 (自动提取主色，建议规避背景)", type=['jpg', 'jpeg', 'png'])
+    ref_file = st.file_uploader("3. 上传参考图", type=['jpg', 'jpeg', 'png'])
 
 if orig_file and mask_file and ref_file:
-    if st.button("🚀 开始计算并渲染", use_container_width=True):
-        with st.spinner("正在智能推演光影参数，请稍候..."):
+    if st.button("🚀 开始渲染 (原画质输出)", use_container_width=True):
+        with st.spinner("正在推演参数并进行高清渲染..."):
             
-            # 1. 载入原始高清大图 (High-Res)，只留在内存中备用，不参与循环！
+            # 1. 载入原始高清大图 (High-Res)
             orig_hr = load_uploaded_image(orig_file)
             mask_raw_hr = load_uploaded_image(mask_file, is_mask=True)
             ref_img = load_uploaded_image(ref_file)
 
-            # 2. 生成低分倍率的草图 (Low-Res)，供算法飞速打草稿
+            # 2. 生成草图 (Low-Res) 用于飞速迭代测算
             orig_lr = create_low_res_proxy(orig_hr, 800)
             mask_raw_lr = create_low_res_proxy(mask_raw_hr, 800)
 
-            # 分别制作 HR 和 LR 的工作用图
             gray_lr = cv2.cvtColor(orig_lr, cv2.COLOR_BGR2GRAY)
             mask_3d_lr = preprocess_mask(mask_raw_lr, orig_lr.shape[:2])
             
@@ -150,15 +150,11 @@ if orig_file and mask_file and ref_file:
             l, a, b = target_lab_8bit.astype(float)
             is_neon = (a > 160 or a < 100) or (b > 160)
             
-            mode_text = '【荧光色】' if is_neon else '【常规色】'
-            st.info(f"🎨 分析完毕 | 模式: {mode_text} | 目标LAB(K-Means主色提取): {target_lab_8bit}")
-
+            # 3. 动态反馈循环 (只用草图跑，防闪退)
             candidates = []
             l_off, a_off, b_off = 0.0, 0.0, 0.0
             learning_rate = 0.6 
-
-            # 3. 动态反馈循环 (只用草图跑，防闪退！)
-            progress_bar = st.progress(0)
+            
             for i in range(15):
                 if is_neon:
                     params = (l_off, a_off, b_off, 120)
@@ -169,8 +165,7 @@ if orig_file and mask_file and ref_file:
 
                 current_lab_std = get_standard_lab(img_lr, mask_3d_lr)
                 de = color.deltaE_ciede2000(target_lab_std, current_lab_std)
-                
-                # 【超级核心】：只记录当前迭代的 params 参数，不再把整张图片存进列表！绝对不爆内存。
+                # 只记录参数，不存图，极省内存
                 candidates.append({'params': params, 'de': de})
 
                 err_l = target_lab_std[0] - current_lab_std[0]
@@ -179,53 +174,50 @@ if orig_file and mask_file and ref_file:
                 l_off += (err_l * 2.55) * learning_rate
                 a_off += err_a * learning_rate
                 b_off += err_b * learning_rate
-                progress_bar.progress((i + 1) / 15)
 
             candidates.sort(key=lambda x: x['de'])
 
-            # ==========================
-            # 4. 高清终极渲染与展示
-            # ==========================
+            # 4. 筛选并执行最终的高清渲染
             valid_candidates = []
             last_de = -1.0
-            
             for c in candidates:
                 if len(valid_candidates) >= 5: break
                 if abs(c['de'] - last_de) < 0.02: continue
                 valid_candidates.append(c)
                 last_de = c['de']
             
-            actual_count = len(valid_candidates)
-            st.success(f"✅ 高清渲染完成！为您提取了 {actual_count} 张不同质感的优选图：")
+            st.success(f"✅ 高清渲染完成！以下为您生成了 {len(valid_candidates)} 张候选图：")
+            cols = st.columns(len(valid_candidates) + 1)
             
-            cols = st.columns(actual_count + 1)
-            with cols[-1]: 
-                ref_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
-                st.image(ref_rgb, caption="📍 颜色参考图", use_column_width=True)
-                st.markdown("<div style='text-align: center; color: gray; font-size: 14px;'>（提取主色对比）</div>", unsafe_allow_html=True)
+            with cols[-1]:
+                st.image(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB), caption="颜色参考图", use_column_width=True)
 
-            # 拿着筛选出的最优 params，去给高清原图 (orig_hr) 上色！
             for idx, c in enumerate(valid_candidates):
                 with cols[idx]:
-                    status = "PASS" if c['de'] < 1.5 else "BEST"
-                    name = f"Result_{idx + 1:02d}_{status}_dE_{c['de']:.2f}.jpg"
-                    
-                    # 【核心执行】：在这里生成最终的超清大图
+                    # 执行高清大图渲染
                     if is_neon:
-                        final_hr_img = render_neon(orig_hr, mask_3d_hr, target_lab_8bit, c['params'])
+                        final_hr = render_neon(orig_hr, mask_3d_hr, target_lab_8bit, c['params'])
                     else:
-                        final_hr_img = render_standard(orig_hr, gray_hr, mask_3d_hr, target_lab_8bit, c['params'])
+                        final_hr = render_standard(orig_hr, gray_hr, mask_3d_hr, target_lab_8bit, c['params'])
                     
-                    # 转换颜色并在网页预览 (Streamlit 会自动缩小预览图适配屏幕，不影响原文件)
-                    rgb_img = cv2.cvtColor(final_hr_img, cv2.COLOR_BGR2RGB)
-                    st.image(rgb_img, caption=f"色差: {c['de']:.2f}", use_column_width=True)
+                    st.image(cv2.cvtColor(final_hr, cv2.COLOR_BGR2RGB), caption=f"色差: {c['de']:.2f}", use_column_width=True)
                     
-                    # 生成下载按钮：把刚才算好的高清大图打包给用户！
-                    is_success, buffer = cv2.imencode(".jpg", final_hr_img)
+                    # 导出 100% 画质 JPG
+                    is_success, buffer = cv2.imencode(".jpg", final_hr, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
                     st.download_button(
-                        label="⬇️ 下载超清大图",
+                        label="⬇️ 下载超清 JPG",
                         data=buffer.tobytes(),
-                        file_name=name,
+                        file_name=f"Color_Result_{idx+1}_dE_{c['de']:.2f}.jpg",
                         mime="image/jpeg",
-                        key=name
+                        key=f"jpg_{idx}"
+                    )
+                    
+                    # 导出 绝对无损 PNG
+                    is_success_p, buffer_p = cv2.imencode(".png", final_hr)
+                    st.download_button(
+                        label="⬇️ 下载无损 PNG",
+                        data=buffer_p.tobytes(),
+                        file_name=f"Color_Result_{idx+1}_dE_{c['de']:.2f}.png",
+                        mime="image/png",
+                        key=f"png_{idx}"
                     )
