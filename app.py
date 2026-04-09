@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 import streamlit as st
 from skimage import color
-from io import BytesIO
 
 # ==========================================
 # 页面基础设置
@@ -12,53 +11,36 @@ st.title("🎨 智能图像换色工具")
 st.markdown("上传模特图、蒙版和参考颜色图，自动计算色差并生成替换后的效果。")
 
 # ==========================================
-# 算法核心函数 (已升级：K-Means 智能主色提取)
+# 算法核心函数 (保留K-Means智能主色提取)
 # ==========================================
 def extract_dominant_lab(img_bgr):
-    """提取图像中心区域的聚类主色，抗高光/阴影干扰"""
     h, w = img_bgr.shape[:2]
-    
-    # 1. 扩大取样范围：取画面中心 60% 的区域 (跳过了边缘的纯背景)
     crop = img_bgr[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]
-    
-    # 2. 缩小图像加快计算速度 (100x100足够提取颜色分布了)
     crop_small = cv2.resize(crop, (100, 100))
     img_lab = cv2.cvtColor(crop_small, cv2.COLOR_BGR2LAB)
     
-    # 3. 使用 K-Means 聚类提取主色调
     pixels = np.float32(img_lab.reshape(-1, 3))
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    
-    # 假设区域内主要有3种颜色：纯净固有色、高光/皮肤、阴影褶皱
     K = 3 
     _, labels, centers = cv2.kmeans(pixels, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     
-    # 4. 找到占比最大的那个颜色聚类（大概率就是纯净的固有色）
     counts = np.bincount(labels.flatten())
-    dominant_cluster_idx = np.argmax(counts)
-    
-    return centers[dominant_cluster_idx]
+    return centers[np.argmax(counts)]
 
 def get_standard_lab(img_bgr, mask_3d=None):
     img_f = img_bgr.astype(np.float32) / 255.0
     lab_f = cv2.cvtColor(img_f, cv2.COLOR_BGR2Lab)
-    
     if mask_3d is not None:
         mask_bool = mask_3d[:, :, 0] > 0.5
         if np.any(mask_bool): return np.mean(lab_f[mask_bool], axis=0)
-        
-    # 当没有蒙版时（处理参考图），使用主色提取算法
     dominant_lab_8bit = extract_dominant_lab(img_bgr)
     return dominant_lab_8bit * [100.0/255.0, 1.0, 1.0] - [0, 128.0, 128.0]
 
 def get_lab_metrics(img_bgr, mask_3d=None):
     img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    
     if mask_3d is not None:
         mask_bool = mask_3d[:, :, 0] > 0.5
         if np.any(mask_bool): return np.mean(img_lab[mask_bool], axis=0)
-        
-    # 当没有蒙版时，使用 K-Means 主色提取
     return extract_dominant_lab(img_bgr)
 
 def preprocess_mask(m, shape):
@@ -113,34 +95,55 @@ def render_neon(orig_img, mask_3d, target_lab, params):
     return np.clip(final_out, 0, 255).astype(np.uint8)
 
 # ==========================================
-# Streamlit 前端交互与工作流
+# 图像工具函数
 # ==========================================
 def load_uploaded_image(uploaded_file, is_mask=False):
+    """只负责读取为原始尺寸数组"""
     if uploaded_file is not None:
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         flags = cv2.IMREAD_UNCHANGED if is_mask else cv2.IMREAD_COLOR
         return cv2.imdecode(file_bytes, flags)
     return None
 
+def create_low_res_proxy(img, max_width=800):
+    """为草图计算专用：将图片缩小，极大降低内存占用和提升速度"""
+    if img is None: return None
+    h, w = img.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return img
+
+# ==========================================
+# Streamlit 前端交互与工作流
+# ==========================================
 col1, col2, col3 = st.columns(3)
 with col1:
     orig_file = st.file_uploader("1. 上传模特图 (原图)", type=['jpg', 'jpeg', 'png'])
 with col2:
     mask_file = st.file_uploader("2. 上传蒙版图 (PNG/JPG)", type=['jpg', 'jpeg', 'png'])
 with col3:
-    # 提示语已优化，指导用户操作
-    ref_file = st.file_uploader("3. 上传参考图 (自动提取主色，建议尽量规避背景)", type=['jpg', 'jpeg', 'png'])
+    ref_file = st.file_uploader("3. 上传参考图 (自动提取主色，建议规避背景)", type=['jpg', 'jpeg', 'png'])
 
 if orig_file and mask_file and ref_file:
     if st.button("🚀 开始计算并渲染", use_container_width=True):
-        with st.spinner("正在进行误差补偿闭环，请稍候..."):
-            # 1. 加载图像
-            orig = load_uploaded_image(orig_file)
-            mask_raw = load_uploaded_image(mask_file, is_mask=True)
+        with st.spinner("正在智能推演光影参数，请稍候..."):
+            
+            # 1. 载入原始高清大图 (High-Res)，只留在内存中备用，不参与循环！
+            orig_hr = load_uploaded_image(orig_file)
+            mask_raw_hr = load_uploaded_image(mask_file, is_mask=True)
             ref_img = load_uploaded_image(ref_file)
 
-            gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
-            mask_3d = preprocess_mask(mask_raw, orig.shape[:2])
+            # 2. 生成低分倍率的草图 (Low-Res)，供算法飞速打草稿
+            orig_lr = create_low_res_proxy(orig_hr, 800)
+            mask_raw_lr = create_low_res_proxy(mask_raw_hr, 800)
+
+            # 分别制作 HR 和 LR 的工作用图
+            gray_lr = cv2.cvtColor(orig_lr, cv2.COLOR_BGR2GRAY)
+            mask_3d_lr = preprocess_mask(mask_raw_lr, orig_lr.shape[:2])
+            
+            gray_hr = cv2.cvtColor(orig_hr, cv2.COLOR_BGR2GRAY)
+            mask_3d_hr = preprocess_mask(mask_raw_hr, orig_hr.shape[:2])
 
             target_lab_8bit = get_lab_metrics(ref_img)
             target_lab_std = get_standard_lab(ref_img)
@@ -154,17 +157,21 @@ if orig_file and mask_file and ref_file:
             l_off, a_off, b_off = 0.0, 0.0, 0.0
             learning_rate = 0.6 
 
-            # 2. 动态反馈循环
+            # 3. 动态反馈循环 (只用草图跑，防闪退！)
             progress_bar = st.progress(0)
             for i in range(15):
                 if is_neon:
-                    img = render_neon(orig, mask_3d, target_lab_8bit, (l_off, a_off, b_off, 120))
+                    params = (l_off, a_off, b_off, 120)
+                    img_lr = render_neon(orig_lr, mask_3d_lr, target_lab_8bit, params)
                 else:
-                    img = render_standard(orig, gray, mask_3d, target_lab_8bit, (1.0, l_off, a_off, b_off))
+                    params = (1.0, l_off, a_off, b_off)
+                    img_lr = render_standard(orig_lr, gray_lr, mask_3d_lr, target_lab_8bit, params)
 
-                current_lab_std = get_standard_lab(img, mask_3d)
+                current_lab_std = get_standard_lab(img_lr, mask_3d_lr)
                 de = color.deltaE_ciede2000(target_lab_std, current_lab_std)
-                candidates.append({'img': img.copy(), 'de': de})
+                
+                # 【超级核心】：只记录当前迭代的 params 参数，不再把整张图片存进列表！绝对不爆内存。
+                candidates.append({'params': params, 'de': de})
 
                 err_l = target_lab_std[0] - current_lab_std[0]
                 err_a = target_lab_std[1] - current_lab_std[1]
@@ -177,50 +184,46 @@ if orig_file and mask_file and ref_file:
             candidates.sort(key=lambda x: x['de'])
 
             # ==========================
-            # 3. 筛选并展示结果 (含去重与右侧对比参考图)
+            # 4. 高清终极渲染与展示
             # ==========================
-            
-            # 先过滤出真正有差异的候选图
             valid_candidates = []
             last_de = -1.0
             
             for c in candidates:
-                if len(valid_candidates) >= 5: 
-                    break
-                # 过滤肉眼看不出区别的重复图
-                if abs(c['de'] - last_de) < 0.02: 
-                    continue
+                if len(valid_candidates) >= 5: break
+                if abs(c['de'] - last_de) < 0.02: continue
                 valid_candidates.append(c)
                 last_de = c['de']
             
             actual_count = len(valid_candidates)
+            st.success(f"✅ 高清渲染完成！为您提取了 {actual_count} 张不同质感的优选图：")
             
-            # 动态更新成功提示文本
-            st.success(f"✅ 渲染完成！为您提取了 {actual_count} 张不同质感的优选图：")
-            
-            # 创建动态分栏：生成的图数量 + 1个参考图栏
             cols = st.columns(actual_count + 1)
-            
-            # 在最右侧一列展示颜色参考图，方便对比
             with cols[-1]: 
                 ref_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
                 st.image(ref_rgb, caption="📍 颜色参考图", use_column_width=True)
                 st.markdown("<div style='text-align: center; color: gray; font-size: 14px;'>（提取主色对比）</div>", unsafe_allow_html=True)
 
-            # 依次展示生成的候选图和下载按钮
+            # 拿着筛选出的最优 params，去给高清原图 (orig_hr) 上色！
             for idx, c in enumerate(valid_candidates):
                 with cols[idx]:
                     status = "PASS" if c['de'] < 1.5 else "BEST"
                     name = f"Result_{idx + 1:02d}_{status}_dE_{c['de']:.2f}.jpg"
                     
-                    # 转换颜色空间用于网页显示 (BGR -> RGB)
-                    rgb_img = cv2.cvtColor(c['img'], cv2.COLOR_BGR2RGB)
+                    # 【核心执行】：在这里生成最终的超清大图
+                    if is_neon:
+                        final_hr_img = render_neon(orig_hr, mask_3d_hr, target_lab_8bit, c['params'])
+                    else:
+                        final_hr_img = render_standard(orig_hr, gray_hr, mask_3d_hr, target_lab_8bit, c['params'])
+                    
+                    # 转换颜色并在网页预览 (Streamlit 会自动缩小预览图适配屏幕，不影响原文件)
+                    rgb_img = cv2.cvtColor(final_hr_img, cv2.COLOR_BGR2RGB)
                     st.image(rgb_img, caption=f"色差: {c['de']:.2f}", use_column_width=True)
                     
-                    # 生成下载按钮
-                    is_success, buffer = cv2.imencode(".jpg", c['img'])
+                    # 生成下载按钮：把刚才算好的高清大图打包给用户！
+                    is_success, buffer = cv2.imencode(".jpg", final_hr_img)
                     st.download_button(
-                        label="⬇️ 下载此图",
+                        label="⬇️ 下载超清大图",
                         data=buffer.tobytes(),
                         file_name=name,
                         mime="image/jpeg",
