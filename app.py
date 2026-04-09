@@ -13,7 +13,7 @@ st.title("🎨 智能图像换色工具")
 st.markdown("上传模特图、蒙版和参考颜色图，自动计算色差并生成替换后的效果。")
 
 # ==========================================
-# 算法核心函数 (保留你的原逻辑)
+# 算法核心函数 
 # ==========================================
 def get_standard_lab(img_bgr, mask_3d=None):
     img_f = img_bgr.astype(np.float32) / 255.0
@@ -32,7 +32,6 @@ def get_lab_metrics(img_bgr, mask_3d=None):
     h, w = img_bgr.shape[:2]
     return np.mean(img_lab[int(h * 0.4):int(h * 0.6), int(w * 0.4):int(w * 0.6)], axis=(0, 1))
 
-# 【修改点】不再传入路径，直接传入解码后的 numpy array
 def preprocess_mask(m, shape):
     if m is None: return np.zeros((*shape, 3), dtype=np.float32)
     m = m[:, :, 3] if (len(m.shape) == 3 and m.shape[2] == 4) else (
@@ -147,24 +146,45 @@ if orig_file and mask_file and ref_file:
 
             candidates.sort(key=lambda x: x['de'])
 
-            # 3. 筛选并展示结果
-            st.success("✅ 渲染完成！以下是为您生成的 5 张不同质感的候选图：")
+            # ==========================
+            # 3. 筛选并展示结果 (已更新)
+            # ==========================
             
-            saved_count = 0
+            # 先过滤出真正有差异的候选图
+            valid_candidates = []
             last_de = -1.0
-            cols = st.columns(5) # 横向显示5张图
-
+            
             for c in candidates:
-                if saved_count >= 5: break
-                if abs(c['de'] - last_de) < 0.02: continue
+                if len(valid_candidates) >= 5: 
+                    break
+                # 过滤肉眼看不出区别的重复图
+                if abs(c['de'] - last_de) < 0.02: 
+                    continue
+                valid_candidates.append(c)
+                last_de = c['de']
+            
+            actual_count = len(valid_candidates)
+            
+            # 动态更新成功提示文本
+            st.success(f"✅ 渲染完成！为您提取了 {actual_count} 张不同质感的优选图：")
+            
+            # 创建动态分栏：生成的图数量 + 1个参考图栏
+            cols = st.columns(actual_count + 1)
+            
+            # 在最右侧一列展示颜色参考图，方便对比
+            with cols[-1]: 
+                ref_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
+                st.image(ref_rgb, caption="📍 颜色参考图", use_column_width=True)
+                st.markdown("<div style='text-align: center; color: gray; font-size: 14px;'>（目标颜色）</div>", unsafe_allow_html=True)
 
-                status = "PASS" if c['de'] < 1.5 else "BEST"
-                name = f"{saved_count + 1:03d}_{status}_dE_{c['de']:.2f}.jpg"
-                
-                # 转换颜色空间用于网页显示 (BGR -> RGB)
-                rgb_img = cv2.cvtColor(c['img'], cv2.COLOR_BGR2RGB)
-                
-                with cols[saved_count]:
+            # 依次展示生成的候选图和下载按钮
+            for idx, c in enumerate(valid_candidates):
+                with cols[idx]:
+                    status = "PASS" if c['de'] < 1.5 else "BEST"
+                    name = f"Result_{idx + 1:02d}_{status}_dE_{c['de']:.2f}.jpg"
+                    
+                    # 转换颜色空间用于网页显示 (BGR -> RGB)
+                    rgb_img = cv2.cvtColor(c['img'], cv2.COLOR_BGR2RGB)
                     st.image(rgb_img, caption=f"色差: {c['de']:.2f}", use_column_width=True)
                     
                     # 生成下载按钮
@@ -176,6 +196,3 @@ if orig_file and mask_file and ref_file:
                         mime="image/jpeg",
                         key=name
                     )
-
-                last_de = c['de']
-                saved_count += 1
