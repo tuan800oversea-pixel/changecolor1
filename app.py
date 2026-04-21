@@ -56,30 +56,35 @@ def get_lab_metrics(img_bgr, mask_3d=None):
     return extract_dominant_lab(img_bgr)
 
 def preprocess_mask(m, shape):
+    """【同步新代码逻辑】预处理掩码：使用 127 阈值并羽化，边缘更平滑"""
     if m is None: return np.zeros((*shape, 3), dtype=np.float32)
     m = m[:, :, 3] if (len(m.shape) == 3 and m.shape[2] == 4) else (
         cv2.cvtColor(m, cv2.COLOR_BGR2GRAY) if len(m.shape) == 3 else m)
     m = cv2.resize(m, (shape[1], shape[0]))
-    _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
+    
+    # 采用新代码的 127 阈值
+    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
     if m[0, 0] > 127: m = cv2.bitwise_not(m)
-    # 羽化处理，使边缘平滑自然
-    return np.repeat((cv2.GaussianBlur(m, (5, 5), 0).astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
+    
+    # 轻微羽化处理
+    m_blur = cv2.GaussianBlur(m, (5, 5), 0).astype(np.float32) / 255.0
+    return np.repeat(m_blur[:, :, np.newaxis], 3, axis=2)
 
 def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
-    """🔥 已修复：包含双边滤波去噪与极高纹理保留的核心渲染器"""
+    """🔥 【完全同步新版引擎】包含极轻度去噪与高精度褶皱质感保留"""
     g, l_off, a_off, b_off, detail_boost = params
     l_t, a_t, b_t = target_lab.astype(float)
     
-    # 1. 极轻度去噪，过滤杂色但保留90%以上原生纹理 (核心修复处)
+    # 1. 极轻度去噪 (采用新代码严谨参数：过滤杂色，保留90%以上原生纹理)
     denoised_gray = cv2.bilateralFilter(gray_img, d=5, sigmaColor=20, sigmaSpace=20)
     
-    # 2. 增强褶皱与纹理细节 (核心修复处)
+    # 2. 增强褶皱与纹理细节
     blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
     detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32)
     detail_layer = detail_layer * detail_boost
     del blur_layer 
     
-    # 3. 基础色彩映射 (基于去噪后的灰度图)
+    # 3. 基础色彩映射 (L通道精确锚定)
     img_norm = denoised_gray.astype(np.float32) / 255.0
     img_gamma = np.power(img_norm + 1e-7, 1.0 / g)
     del img_norm, denoised_gray 
@@ -108,7 +113,7 @@ def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
     result_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
     del merged_lab
     
-    # 5. 原图蒙版混合
+    # 5. 原图蒙版混合 (最终融合)
     final_f = (result_bgr.astype(np.float32) / 255.0) * mask_3d + \
               (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
     del result_bgr
@@ -119,7 +124,7 @@ def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
     return final_res
 
 def render_neon(orig_img, mask_3d, target_lab, params):
-    """霓虹/高饱和色彩专属渲染器"""
+    """霓虹/高饱和色彩专属渲染器 (保留原逻辑用于高饱和特殊场景)"""
     l_off, ao, bo, dg = params
     l_t, a_t, b_t = target_lab.astype(float)
     
@@ -220,20 +225,20 @@ if orig_file and mask_file and ref_color_file:
             # 4. 动态反馈循环 (只用草图跑)
             candidates = []
             l_off, a_off, b_off = 0.0, 0.0, 0.0
-            learning_rate = 0.5  # 使用新版学习率
+            learning_rate = 0.5  
             
-            for i in range(12):  # 使用新版迭代次数
+            for i in range(12): 
                 if is_neon:
                     params = (l_off, a_off, b_off, 120)
                     img_lr = render_neon(orig_lr, mask_3d_lr, target_lab_8bit, params)
                 else:
-                    # 包含 detail_boost=1.3 参数，配合去噪追求写实纹理
+                    # 【核心合并点】使用了新代码中指定的 detail_boost=1.3 参数，配合轻度去噪增强写实感
                     params = (1.0, l_off, a_off, b_off, 1.3)
                     img_lr = render_standard(orig_lr, gray_lr, mask_3d_lr, target_lab_8bit, params)
 
                 # 使用草图计算当前生成结果的标准 LAB 色
                 current_lab_std = get_standard_lab(img_lr, mask_3d_lr)
-                # 与【图4：参考服饰】的标准色进行 CIEDE2000 色差对比
+                # 与参考服饰标准色进行 CIEDE2000 色差对比
                 de = color.deltaE_ciede2000(target_lab_std, current_lab_std)
                 candidates.append({'params': params, 'de': de})
 
@@ -270,7 +275,7 @@ if orig_file and mask_file and ref_color_file:
             with cols[-1]:
                 st.image(cv2.cvtColor(ref_color_img, cv2.COLOR_BGR2RGB), caption="颜色抓取来源", use_column_width=True)
                 if ref_std_file:
-                    st.image(cv2.cvtColor(ref_std_img, cv2.COLOR_BGR2RGB), caption="色差比对来源", use_column_width=True)
+                    st.image(cv2.cvtColor(ref_std_img, cv2.COLOR_BGR2RGB), caption="色差比令人来源", use_column_width=True)
 
             for idx, c in enumerate(valid_candidates):
                 with cols[idx]:
