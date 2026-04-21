@@ -9,7 +9,7 @@ import gc  # 引入垃圾回收模块
 # ==========================================
 st.set_page_config(page_title="智能图像换色工具-超清无损版", layout="wide")
 st.title("🎨 智能图像换色工具 (超清无损版)")
-st.markdown("上传模特图、蒙版和参考色，系统将自动推演光影参数并输出原画质结果。")
+st.markdown("上传模特图、蒙版以及参考图，系统将自动推演光影参数并输出原画质结果。")
 
 # ==========================================
 # 算法核心函数
@@ -30,6 +30,7 @@ def extract_dominant_lab(img_bgr):
     return centers[np.argmax(counts)]
 
 def get_standard_lab(img_bgr, mask_3d=None):
+    """提取标准的 CIELAB (D65) 值用于色差计算"""
     img_f = img_bgr.astype(np.float32) / 255.0
     lab_f = cv2.cvtColor(img_f, cv2.COLOR_BGR2Lab)
     if mask_3d is not None:
@@ -43,6 +44,7 @@ def get_standard_lab(img_bgr, mask_3d=None):
     return dominant_lab_8bit * [100.0/255.0, 1.0, 1.0] - [0, 128.0, 128.0]
 
 def get_lab_metrics(img_bgr, mask_3d=None):
+    """提取用于渲染引导的 8bit LAB 颜色"""
     img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     if mask_3d is not None:
         mask_bool = mask_3d[:, :, 0] > 0.5
@@ -60,11 +62,11 @@ def preprocess_mask(m, shape):
     m = cv2.resize(m, (shape[1], shape[0]))
     _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
     if m[0, 0] > 127: m = cv2.bitwise_not(m)
-    # 融合新代码：略微加大羽化半径(5,5)使边缘更平滑自然
+    # 羽化处理，使边缘平滑自然
     return np.repeat((cv2.GaussianBlur(m, (5, 5), 0).astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
 
-# 【核心升级】植入新代码的极高纹理保留渲染器，并保留原有严格的内存回收规范
 def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
+    """极高纹理保留渲染器 (微弱去噪 + 质感优先)"""
     g, l_off, a_off, b_off, detail_boost = params
     l_t, a_t, b_t = target_lab.astype(float)
     
@@ -75,12 +77,12 @@ def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
     blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
     detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32)
     detail_layer = detail_layer * detail_boost
-    del blur_layer # 用完即删
+    del blur_layer 
     
     # 3. 基础色彩映射
     img_norm = denoised_gray.astype(np.float32) / 255.0
     img_gamma = np.power(img_norm + 1e-7, 1.0 / g)
-    del img_norm, denoised_gray # 用完即删
+    del img_norm, denoised_gray 
     
     target_L_val = np.clip(l_t + l_off, 0, 255)
     mask_bool = mask_3d[:, :, 0] > 0.5
@@ -90,7 +92,7 @@ def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
     
     # 亮度映射并合并增强后的细节层
     shadow_map = np.clip((img_gamma + shift_l) * 255.0 + detail_layer, 0, 255.0)
-    del img_gamma, detail_layer # 用完即删
+    del img_gamma, detail_layer 
     
     # 4. 构建最终 LAB 并合并
     final_a = np.clip(a_t + a_off, 0, 255)
@@ -117,6 +119,7 @@ def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
     return final_res
 
 def render_neon(orig_img, mask_3d, target_lab, params):
+    """霓虹/高饱和色彩专属渲染器"""
     l_off, ao, bo, dg = params
     l_t, a_t, b_t = target_lab.astype(float)
     
@@ -171,36 +174,35 @@ def create_low_res_proxy(img, max_width=800):
 # ==========================================
 # 主流程
 # ==========================================
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     orig_file = st.file_uploader("1. 上传模特图 (原图)", type=['jpg', 'jpeg', 'png'])
 with col2:
     mask_file = st.file_uploader("2. 上传蒙版图 (PNG/JPG)", type=['jpg', 'jpeg', 'png'])
 with col3:
-    # 【核心升级】支持多选上传参考图，对应新代码逻辑
-    ref_files = st.file_uploader("3. 上传参考图 (可多选)", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
+    ref_color_file = st.file_uploader("3. 上传参考色块 (提取调色目标)", type=['jpg', 'jpeg', 'png'])
+with col4:
+    ref_std_file = st.file_uploader("4. 上传参考服饰 (校验色差，可选)", type=['jpg', 'jpeg', 'png'])
 
-if orig_file and mask_file and ref_files:
+if orig_file and mask_file and ref_color_file:
     if st.button("🚀 开始渲染 (原画质输出)", use_container_width=True):
         with st.spinner("正在推演参数并进行高清渲染... (这可能需要一些时间)"):
             
-            # 1. 载入原始高清大图 (High-Res)
+            # 1. 载入原始高清大图及蒙版
             orig_hr = load_uploaded_image(orig_file)
             mask_raw_hr = load_uploaded_image(mask_file, is_mask=True)
             
-            # 【核心升级】融合多张参考图的 LAB 数据
-            all_labs_8bit = []
-            all_labs_std = []
-            for rf in ref_files:
-                ref_img_temp = load_uploaded_image(rf)
-                if ref_img_temp is not None:
-                    all_labs_8bit.append(get_lab_metrics(ref_img_temp))
-                    all_labs_std.append(get_standard_lab(ref_img_temp))
-            
-            target_lab_8bit = np.mean(all_labs_8bit, axis=0)
-            target_lab_std = np.mean(all_labs_std, axis=0)
+            # 2. 载入参考图 (分离调色与校验逻辑)
+            ref_color_img = load_uploaded_image(ref_color_file)
+            # 如果没有上传校验标准图，就复用色块图作为标准
+            ref_std_img = load_uploaded_image(ref_std_file) if ref_std_file else ref_color_img
 
-            # 2. 生成草图 (Low-Res) 用于飞速迭代测算
+            # 获取渲染用的目标色 (来自图3)
+            target_lab_8bit = get_lab_metrics(ref_color_img)
+            # 获取计算 Delta E 用的标准色 (来自图4)
+            target_lab_std = get_standard_lab(ref_std_img)
+
+            # 3. 生成草图 (Low-Res) 用于飞速迭代测算
             orig_lr = create_low_res_proxy(orig_hr, 800)
             mask_raw_lr = create_low_res_proxy(mask_raw_hr, 800)
 
@@ -215,21 +217,23 @@ if orig_file and mask_file and ref_files:
             l, a, b = target_lab_8bit.astype(float)
             is_neon = (a > 160 or a < 100) or (b > 160)
             
-            # 3. 动态反馈循环 (只用草图跑)
+            # 4. 动态反馈循环 (只用草图跑)
             candidates = []
             l_off, a_off, b_off = 0.0, 0.0, 0.0
-            learning_rate = 0.5  # 遵循新代码将学习率调整为 0.5
+            learning_rate = 0.5  # 使用新版学习率
             
-            for i in range(12):  # 遵循新代码调整为 12 次迭代
+            for i in range(12):  # 使用新版迭代次数
                 if is_neon:
                     params = (l_off, a_off, b_off, 120)
                     img_lr = render_neon(orig_lr, mask_3d_lr, target_lab_8bit, params)
                 else:
-                    # 【核心升级】增加 detail_boost=1.3 参数，追求写实纹理
+                    # 增加 detail_boost=1.3 参数，追求写实纹理
                     params = (1.0, l_off, a_off, b_off, 1.3)
                     img_lr = render_standard(orig_lr, gray_lr, mask_3d_lr, target_lab_8bit, params)
 
+                # 使用草图计算当前生成结果的标准 LAB 色
                 current_lab_std = get_standard_lab(img_lr, mask_3d_lr)
+                # 与【图4：参考服饰】的标准色进行 CIEDE2000 色差对比
                 de = color.deltaE_ciede2000(target_lab_std, current_lab_std)
                 candidates.append({'params': params, 'de': de})
 
@@ -250,22 +254,23 @@ if orig_file and mask_file and ref_files:
             del orig_lr, gray_lr, mask_3d_lr
             gc.collect()
 
-            # 4. 筛选并执行最终的高清渲染
+            # 5. 筛选并执行最终的高清渲染
             valid_candidates = []
             last_de = -1.0
             for c in candidates:
                 if len(valid_candidates) >= 5: break
-                if abs(c['de'] - last_de) < 0.05: continue # 遵循新代码收紧阈值防重复
+                if abs(c['de'] - last_de) < 0.05: continue
                 valid_candidates.append(c)
                 last_de = c['de']
             
             st.success(f"✅ 高清渲染完成！以下为您生成了 {len(valid_candidates)} 张候选图：")
             cols = st.columns(len(valid_candidates) + 1)
             
+            # 右侧展示参考图确认
             with cols[-1]:
-                # 拿第一张参考图做展示位
-                display_ref = load_uploaded_image(ref_files[0])
-                st.image(cv2.cvtColor(display_ref, cv2.COLOR_BGR2RGB), caption="混合参考主图", use_column_width=True)
+                st.image(cv2.cvtColor(ref_color_img, cv2.COLOR_BGR2RGB), caption="颜色抓取来源", use_column_width=True)
+                if ref_std_file:
+                    st.image(cv2.cvtColor(ref_std_img, cv2.COLOR_BGR2RGB), caption="色差比对来源", use_column_width=True)
 
             for idx, c in enumerate(valid_candidates):
                 with cols[idx]:
@@ -304,5 +309,6 @@ if orig_file and mask_file and ref_files:
                     gc.collect() 
             
             # 流程彻底结束后，清空底图大矩阵
-            del orig_hr, gray_hr, mask_3d_hr
+            del orig_hr, gray_hr, mask_3d_hr, ref_color_img
+            if 'ref_std_img' in locals(): del ref_std_img
             gc.collect()
