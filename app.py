@@ -60,19 +60,27 @@ def preprocess_mask(m, shape):
     m = cv2.resize(m, (shape[1], shape[0]))
     _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
     if m[0, 0] > 127: m = cv2.bitwise_not(m)
-    return np.repeat((cv2.GaussianBlur(m, (3, 3), 0).astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
+    # 融合新代码：略微加大羽化半径(5,5)使边缘更平滑自然
+    return np.repeat((cv2.GaussianBlur(m, (5, 5), 0).astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
 
+# 【核心升级】植入新代码的极高纹理保留渲染器，并保留原有严格的内存回收规范
 def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
-    g, l_off, a_off, b_off = params
+    g, l_off, a_off, b_off, detail_boost = params
     l_t, a_t, b_t = target_lab.astype(float)
     
-    blur = cv2.GaussianBlur(gray_img, (5, 5), 0)
-    high_pass_3d = np.repeat((np.clip(gray_img.astype(np.float32) - blur.astype(np.float32) + 128.0, 0, 255) / 255.0)[:, :, np.newaxis], 3, axis=2)
-    del blur # 用完即删
+    # 1. 极轻度去噪，过滤杂色但保留90%以上原生纹理
+    denoised_gray = cv2.bilateralFilter(gray_img, d=5, sigmaColor=20, sigmaSpace=20)
     
-    img_norm = gray_img.astype(np.float32) / 255.0
+    # 2. 增强褶皱与纹理细节
+    blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
+    detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32)
+    detail_layer = detail_layer * detail_boost
+    del blur_layer # 用完即删
+    
+    # 3. 基础色彩映射
+    img_norm = denoised_gray.astype(np.float32) / 255.0
     img_gamma = np.power(img_norm + 1e-7, 1.0 / g)
-    del img_norm # 用完即删
+    del img_norm, denoised_gray # 用完即删
     
     target_L_val = np.clip(l_t + l_off, 0, 255)
     mask_bool = mask_3d[:, :, 0] > 0.5
@@ -80,35 +88,28 @@ def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
     shift_l = (target_L_val / 255.0) - current_mean_l
     del mask_bool
     
-    shadow_map = np.clip(img_gamma + shift_l, 0, 1.0) * 255.0
-    del img_gamma # 用完即删
+    # 亮度映射并合并增强后的细节层
+    shadow_map = np.clip((img_gamma + shift_l) * 255.0 + detail_layer, 0, 255.0)
+    del img_gamma, detail_layer # 用完即删
     
-    merged_lab = cv2.merge([shadow_map.astype(np.uint8), np.full_like(shadow_map, int(a_t), dtype=np.uint8), np.full_like(shadow_map, int(b_t), dtype=np.uint8)])
-    del shadow_map # 用完即删
-    
-    base_colored_f = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR).astype(np.float32) / 255.0
-    del merged_lab # 用完即删
-    
-    mask_low = base_colored_f <= 0.5
-    result_f = np.where(mask_low, 2.0 * base_colored_f * high_pass_3d, 1.0 - 2.0 * (1.0 - base_colored_f) * (1.0 - high_pass_3d))
-    del mask_low, base_colored_f, high_pass_3d # 用完即删，释放3个大型矩阵
-    
-    result_bgr_8u = (np.clip(result_f, 0, 1) * 255).astype(np.uint8)
-    del result_f 
-    
-    result_lab = cv2.cvtColor(result_bgr_8u, cv2.COLOR_BGR2LAB)
-    del result_bgr_8u 
-    
+    # 4. 构建最终 LAB 并合并
     final_a = np.clip(a_t + a_off, 0, 255)
     final_b = np.clip(b_t + b_off, 0, 255)
-    corrected_lab = cv2.merge([result_lab[:, :, 0], np.full_like(result_lab[:, :, 0], int(final_a), dtype=np.uint8), np.full_like(result_lab[:, :, 0], int(final_b), dtype=np.uint8)])
-    del result_lab
     
-    corrected_bgr_f = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR).astype(np.float32) / 255.0
-    del corrected_lab
+    merged_lab = cv2.merge([
+        shadow_map.astype(np.uint8), 
+        np.full_like(shadow_map, int(final_a), dtype=np.uint8), 
+        np.full_like(shadow_map, int(final_b), dtype=np.uint8)
+    ])
+    del shadow_map
     
-    final_f = corrected_bgr_f * mask_3d + (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
-    del corrected_bgr_f
+    result_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
+    del merged_lab
+    
+    # 5. 原图蒙版混合
+    final_f = (result_bgr.astype(np.float32) / 255.0) * mask_3d + \
+              (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
+    del result_bgr
     
     final_res = (np.clip(final_f, 0, 1) * 255.0).astype(np.uint8)
     del final_f
@@ -125,14 +126,14 @@ def render_neon(orig_img, mask_3d, target_lab, params):
     
     avg_detail = np.mean(gray_detail[mask_3d[:, :, 0] > 0.1])
     detail_map = gray_detail - avg_detail
-    del gray_detail # 用完即删
+    del gray_detail 
     
     t_l, t_a, t_b = np.clip(l_t + l_off, 0, 255), np.clip(a_t + ao, 0, 255), np.clip(b_t + bo, 0, 255)
     l_layer = np.clip(np.full(gray.shape, t_l, dtype=np.float32) + (detail_map * dg), 0, 255)
-    del detail_map # 用完即删
+    del detail_map 
     
     final_lab = cv2.merge([l_layer.astype(np.uint8), np.full(gray.shape, int(t_a), dtype=np.uint8), np.full(gray.shape, int(t_b), dtype=np.uint8)])
-    del l_layer, gray # 用完即删
+    del l_layer, gray 
     
     res_bgr = cv2.cvtColor(final_lab, cv2.COLOR_LAB2BGR)
     del final_lab
@@ -160,7 +161,6 @@ def load_uploaded_image(uploaded_file, is_mask=False):
     return None
 
 def create_low_res_proxy(img, max_width=800):
-    """草图计算专用：将图片缩小以保护内存"""
     if img is None: return None
     h, w = img.shape[:2]
     if w > max_width:
@@ -177,16 +177,28 @@ with col1:
 with col2:
     mask_file = st.file_uploader("2. 上传蒙版图 (PNG/JPG)", type=['jpg', 'jpeg', 'png'])
 with col3:
-    ref_file = st.file_uploader("3. 上传参考图", type=['jpg', 'jpeg', 'png'])
+    # 【核心升级】支持多选上传参考图，对应新代码逻辑
+    ref_files = st.file_uploader("3. 上传参考图 (可多选)", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
 
-if orig_file and mask_file and ref_file:
+if orig_file and mask_file and ref_files:
     if st.button("🚀 开始渲染 (原画质输出)", use_container_width=True):
         with st.spinner("正在推演参数并进行高清渲染... (这可能需要一些时间)"):
             
             # 1. 载入原始高清大图 (High-Res)
             orig_hr = load_uploaded_image(orig_file)
             mask_raw_hr = load_uploaded_image(mask_file, is_mask=True)
-            ref_img = load_uploaded_image(ref_file)
+            
+            # 【核心升级】融合多张参考图的 LAB 数据
+            all_labs_8bit = []
+            all_labs_std = []
+            for rf in ref_files:
+                ref_img_temp = load_uploaded_image(rf)
+                if ref_img_temp is not None:
+                    all_labs_8bit.append(get_lab_metrics(ref_img_temp))
+                    all_labs_std.append(get_standard_lab(ref_img_temp))
+            
+            target_lab_8bit = np.mean(all_labs_8bit, axis=0)
+            target_lab_std = np.mean(all_labs_std, axis=0)
 
             # 2. 生成草图 (Low-Res) 用于飞速迭代测算
             orig_lr = create_low_res_proxy(orig_hr, 800)
@@ -194,28 +206,27 @@ if orig_file and mask_file and ref_file:
 
             gray_lr = cv2.cvtColor(orig_lr, cv2.COLOR_BGR2GRAY)
             mask_3d_lr = preprocess_mask(mask_raw_lr, orig_lr.shape[:2])
-            del mask_raw_lr # 释放原始低分辨率蒙版
+            del mask_raw_lr 
             
             gray_hr = cv2.cvtColor(orig_hr, cv2.COLOR_BGR2GRAY)
             mask_3d_hr = preprocess_mask(mask_raw_hr, orig_hr.shape[:2])
-            del mask_raw_hr # 释放原始高分辨率蒙版
+            del mask_raw_hr 
 
-            target_lab_8bit = get_lab_metrics(ref_img)
-            target_lab_std = get_standard_lab(ref_img)
             l, a, b = target_lab_8bit.astype(float)
             is_neon = (a > 160 or a < 100) or (b > 160)
             
             # 3. 动态反馈循环 (只用草图跑)
             candidates = []
             l_off, a_off, b_off = 0.0, 0.0, 0.0
-            learning_rate = 0.6 
+            learning_rate = 0.5  # 遵循新代码将学习率调整为 0.5
             
-            for i in range(15):
+            for i in range(12):  # 遵循新代码调整为 12 次迭代
                 if is_neon:
                     params = (l_off, a_off, b_off, 120)
                     img_lr = render_neon(orig_lr, mask_3d_lr, target_lab_8bit, params)
                 else:
-                    params = (1.0, l_off, a_off, b_off)
+                    # 【核心升级】增加 detail_boost=1.3 参数，追求写实纹理
+                    params = (1.0, l_off, a_off, b_off, 1.3)
                     img_lr = render_standard(orig_lr, gray_lr, mask_3d_lr, target_lab_8bit, params)
 
                 current_lab_std = get_standard_lab(img_lr, mask_3d_lr)
@@ -244,7 +255,7 @@ if orig_file and mask_file and ref_file:
             last_de = -1.0
             for c in candidates:
                 if len(valid_candidates) >= 5: break
-                if abs(c['de'] - last_de) < 0.02: continue
+                if abs(c['de'] - last_de) < 0.05: continue # 遵循新代码收紧阈值防重复
                 valid_candidates.append(c)
                 last_de = c['de']
             
@@ -252,7 +263,9 @@ if orig_file and mask_file and ref_file:
             cols = st.columns(len(valid_candidates) + 1)
             
             with cols[-1]:
-                st.image(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB), caption="颜色参考图", use_column_width=True)
+                # 拿第一张参考图做展示位
+                display_ref = load_uploaded_image(ref_files[0])
+                st.image(cv2.cvtColor(display_ref, cv2.COLOR_BGR2RGB), caption="混合参考主图", use_column_width=True)
 
             for idx, c in enumerate(valid_candidates):
                 with cols[idx]:
@@ -262,7 +275,6 @@ if orig_file and mask_file and ref_file:
                     else:
                         final_hr = render_standard(orig_hr, gray_hr, mask_3d_hr, target_lab_8bit, c['params'])
                     
-                    # 为了防止转码时内存炸裂，在展示前拷贝给 st.image
                     st.image(cv2.cvtColor(final_hr, cv2.COLOR_BGR2RGB), caption=f"色差: {c['de']:.2f}", use_column_width=True)
                     
                     # 导出 100% 画质 JPG
@@ -274,7 +286,7 @@ if orig_file and mask_file and ref_file:
                         mime="image/jpeg",
                         key=f"jpg_{idx}"
                     )
-                    del buffer # 释放 JPG buffer
+                    del buffer 
                     
                     # 导出 绝对无损 PNG
                     is_success_p, buffer_p = cv2.imencode(".png", final_hr)
@@ -285,12 +297,12 @@ if orig_file and mask_file and ref_file:
                         mime="image/png",
                         key=f"png_{idx}"
                     )
-                    del buffer_p # 释放 PNG buffer
+                    del buffer_p 
                     
                     # 极其重要：每一张大图生成和按钮渲染完毕后，立刻删除内存中的成品图
                     del final_hr
                     gc.collect() 
             
             # 流程彻底结束后，清空底图大矩阵
-            del orig_hr, gray_hr, mask_3d_hr, ref_img
+            del orig_hr, gray_hr, mask_3d_hr
             gc.collect()
