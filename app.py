@@ -7,8 +7,8 @@ import gc  # 引入垃圾回收模块
 # ==========================================
 # 页面基础设置
 # ==========================================
-st.set_page_config(page_title="智能图像换色工具-超清无损版", layout="wide")
-st.title("🎨 智能图像换色工具 (超清无损版)")
+st.set_page_config(page_title="智能图像换色工具-质感增强版", layout="wide")
+st.title("🎨 智能图像换色工具 (质感增强校验版)")
 st.markdown("上传模特图、蒙版以及参考图，系统将自动推演光影参数并输出原画质结果。")
 
 # ==========================================
@@ -66,20 +66,20 @@ def preprocess_mask(m, shape):
     return np.repeat((cv2.GaussianBlur(m, (5, 5), 0).astype(np.float32) / 255.0)[:, :, np.newaxis], 3, axis=2)
 
 def render_standard(orig_img, gray_img, mask_3d, target_lab, params):
-    """极高纹理保留渲染器 (微弱去噪 + 质感优先)"""
+    """🔥 已修复：包含双边滤波去噪与极高纹理保留的核心渲染器"""
     g, l_off, a_off, b_off, detail_boost = params
     l_t, a_t, b_t = target_lab.astype(float)
     
-    # 1. 极轻度去噪，过滤杂色但保留90%以上原生纹理
+    # 1. 极轻度去噪，过滤杂色但保留90%以上原生纹理 (核心修复处)
     denoised_gray = cv2.bilateralFilter(gray_img, d=5, sigmaColor=20, sigmaSpace=20)
     
-    # 2. 增强褶皱与纹理细节
+    # 2. 增强褶皱与纹理细节 (核心修复处)
     blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
     detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32)
     detail_layer = detail_layer * detail_boost
     del blur_layer 
     
-    # 3. 基础色彩映射
+    # 3. 基础色彩映射 (基于去噪后的灰度图)
     img_norm = denoised_gray.astype(np.float32) / 255.0
     img_gamma = np.power(img_norm + 1e-7, 1.0 / g)
     del img_norm, denoised_gray 
@@ -227,7 +227,7 @@ if orig_file and mask_file and ref_color_file:
                     params = (l_off, a_off, b_off, 120)
                     img_lr = render_neon(orig_lr, mask_3d_lr, target_lab_8bit, params)
                 else:
-                    # 增加 detail_boost=1.3 参数，追求写实纹理
+                    # 包含 detail_boost=1.3 参数，配合去噪追求写实纹理
                     params = (1.0, l_off, a_off, b_off, 1.3)
                     img_lr = render_standard(orig_lr, gray_lr, mask_3d_lr, target_lab_8bit, params)
 
